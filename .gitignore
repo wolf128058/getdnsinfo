@@ -1,2 +1,6 @@
+/.venv/*
+/bin/*
 /data/*
 !/data/.gitkeep
+/lib64
+/venv/*
