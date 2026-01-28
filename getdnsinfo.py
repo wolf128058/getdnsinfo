@@ -54,14 +54,14 @@ def resolve_dns(domain, args, dns_resolver):
 
     try:
         my_target_ns = dns_resolver.resolve(punycode_domain, 'NS')
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):
         my_target_ns = []
         if not args.quiet:
             print('# No Direct NS found!')
 
     try:
         tld_target_ns = dns_resolver.resolve(get_fld(punycode_domain, fix_protocol=True), 'NS')
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):
         tld_target_ns = []
         if not args.quiet:
             print('# No NS for TLD found!')
@@ -72,8 +72,14 @@ def resolve_dns(domain, args, dns_resolver):
         return False, None
 
     for ns in target_ns:
-        ns_a = dns_resolver.resolve(str(ns).strip('.'), 'A')
-        ns_ips.extend(str(data) for data in ns_a)
+        try:
+            ns_a = dns_resolver.resolve(str(ns).strip('.'), 'A')
+            ns_ips.extend(str(data) for data in ns_a)
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):
+            continue
+
+    if not ns_ips:
+        return False, None
 
     dns_resolver.nameservers = ns_ips
     if not args.quiet:
@@ -83,36 +89,40 @@ def resolve_dns(domain, args, dns_resolver):
 def gather_dns_data(domain, dns_resolver, ns_ips, args):
     answers = {}
 
-    for entry in DNS_ENTRIES:
-        try:
-            answer = dns_resolver.resolve(domain, entry)
-            answers[entry] = [str(data) for data in answer]
-        except dns.resolver.NoAnswer:
-            continue
-        except dns.resolver.NXDOMAIN:
-            fallback_nonanswers = True
-            if not args.quiet:
-                print("# No resolving answer from " + ns_ips[0])
-            while len(ns_ips) > 1 and fallback_nonanswers is True:
-                removed_ns = ns_ips.pop(0)
-                if not args.quiet:
-                    print("# Removed non-answering " + removed_ns + " from list and fallback to "+ str(ns_ips))
-                try:
-                    answer = dns_resolver.resolve(domain, entry)
-                    answers[entry] = [str(data) for data in answer]
-                    fallback_nonanswers == False
-                except dns.resolver.NXDOMAIN:
-                    continue
-
-    while len(answers.keys())== 0:
-        removed_ns = ns_ips.pop(0)
+    if not ns_ips:
         if not args.quiet:
-            print("# Removed non/empty-answering " + removed_ns + " from list and fallback to "+ str(ns_ips))
-        try:
-            answer = dns_resolver.resolve(domain, entry)
-            answers[entry] = [str(data) for data in answer]
-        except dns.resolver.NoAnswer:
-            continue
+            print("# No nameservers available for " + domain)
+        return answers
+
+    original_nameservers = list(dns_resolver.nameservers)
+    working_ns = list(ns_ips)
+
+    for entry in DNS_ENTRIES:
+        resolved = False
+        for ns in working_ns:
+            dns_resolver.nameservers = [ns]
+            try:
+                answer = dns_resolver.resolve(domain, entry)
+                answers[entry] = [str(data) for data in answer]
+                resolved = True
+                break
+            except dns.resolver.NoAnswer:
+                resolved = True
+                break
+            except dns.resolver.NXDOMAIN:
+                if not args.quiet:
+                    print("# NXDOMAIN for " + domain)
+                dns_resolver.nameservers = original_nameservers
+                return answers
+            except (dns.resolver.NoNameservers, dns.exception.Timeout):
+                if not args.quiet:
+                    print("# No response from " + ns + " for " + entry)
+                continue
+        if not resolved:
+            if not args.quiet:
+                print("# No response from any nameserver for " + domain + " " + entry)
+
+    dns_resolver.nameservers = original_nameservers
 
     return answers
 
@@ -125,7 +135,7 @@ def create_prefixed_answers(punycode_domain, answers, dns_resolver, args):
         try:
             dmarc_answer = dns_resolver.resolve('_dmarc.' + punycode_domain, 'CNAME')
             prefixed_answers['_dmarc'] = {'CNAME': [str(data) for data in dmarc_answer]}
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):
             if not args.quiet:
                 print('# no dmarc-cname-info for ' + args.domain + ' found.')
 
@@ -133,7 +143,7 @@ def create_prefixed_answers(punycode_domain, answers, dns_resolver, args):
         try:
             dmarc_answer = dns_resolver.resolve('_dmarc.' + punycode_domain, 'TXT')
             prefixed_answers.setdefault('_dmarc', {})['TXT'] = [str(data) for data in dmarc_answer]
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):
             if not args.quiet:
                 print('# no dmarc-txt-info for ' + args.domain + ' found.')
 
@@ -192,6 +202,8 @@ def main():
 
     if not own_resolver_found and not args.quiet:
         print("# No NS found for " + args.domain)
+        dns_resolver.nameservers = [DEFAULT_NAMESERVER]
+        ns_ips = [DEFAULT_NAMESERVER]
 
     answers = gather_dns_data(punycode_domain, dns_resolver, ns_ips, args)
     prefixed_answers = create_prefixed_answers(punycode_domain, answers, dns_resolver, args)
